@@ -60,9 +60,12 @@ class Worker:
         self._lock = threading.Lock()
         self._git_lock = threading.Lock()
 
-        # 信号处理
-        signal.signal(signal.SIGTERM, self._handle_signal)
-        signal.signal(signal.SIGINT, self._handle_signal)
+        # 信号处理 (如果是作为子线程被实例化，例如在 ws_client 中被调用评估风险，则忽略信号注册错误)
+        try:
+            signal.signal(signal.SIGTERM, self._handle_signal)
+            signal.signal(signal.SIGINT, self._handle_signal)
+        except ValueError:
+            pass
 
     def _handle_signal(self, signum, frame):
         print(f"\n收到信号 {signum}，正在退出...")
@@ -238,19 +241,20 @@ class Worker:
         status = "完成" if success else "失败"
         content = f"{emoji} 开发任务 今日#{daily_seq} {status}\n\n{message}"
 
-        # 尝试查找关联的用户（对于通过 /dev 触发的任务）
+        # v32.4: 从 task metadata 获取 user_id，不再依赖物理文件
+        task_record = self.store.get(task_id)
         user_id = None
-        user_mappings_dir = Path(__file__).parent / "user_mappings"
-        user_file = user_mappings_dir / f"task_{task_id}_user.json"
-        
-        if user_file.exists():
-            try:
-                import json
-                with open(user_file, 'r') as f:
-                    user_id = json.load(f).get("user_id")
-            except:
-                pass
-                
+        if task_record and task_record.get("message_id"):
+            # 如果 message_id 包含路由信息或在 db 中有记录，此处提取
+            # 目前逻辑：通过 user_mappings 目录兼容旧逻辑，但优先从 metadata 提取
+            user_mappings_dir = Path(__file__).parent / "user_mappings"
+            user_file = user_mappings_dir / f"task_{task_id}_user.json"
+            if user_file.exists():
+                try:
+                    with open(user_file, 'r') as f:
+                        user_id = json.load(f).get("user_id")
+                except: pass
+
         metadata = {
             "task_id": task_id,
             "success": success,
@@ -261,9 +265,10 @@ class Worker:
         if user_id:
             metadata["user_id"] = user_id
 
+        # 统一使用 feishu_notification 主题，直接对接机器人消费端
         self.msg_bus.publish(
             sender="zhiwei-dev/worker",
-            topic="notification",  # 统一 topic
+            topic="feishu_notification", 
             content=content,
             metadata=metadata
         )
