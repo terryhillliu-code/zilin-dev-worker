@@ -17,3 +17,7 @@ artifacts/
 # 临时文件
 *.bak.*
 /tmp/
+
+# 数据库备份
+db_backups/
+
