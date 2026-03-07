@@ -1,0 +1,28 @@
+# zhiwei-dev 配置文件
+
+# 执行后端
+backend: claude_code
+
+# Claude Code 参数
+claude:
+  model: qwen3-coder-plus
+  allowed_tools: "Edit,Write,Read"
+  timeout: 300  # 秒
+
+# Git 配置
+git:
+  base_repo: ~/zhiwei-scheduler
+  worktree_base: /tmp/zhiwei-worktrees
+
+# 任务配置
+task:
+  max_attempts: 2
+  stale_timeout_minutes: 10
+
+# 受保护文件（涉及这些文件的任务直接拒绝）
+protected_files:
+  - ws_client.py
+  - docker-compose.yml
+  - .env
+  - openclaw.json
+  - tasks.db

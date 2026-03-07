@@ -1,0 +1,19 @@
+# 数据库（二进制，不入库，单独备份）
+tasks.db
+tasks.db-wal
+tasks.db-shm
+
+# 虚拟环境
+venv/
+__pycache__/
+*.pyc
+
+# 产物目录（内容太多）
+artifacts/
+
+# 系统文件
+.DS_Store
+
+# 临时文件
+*.bak.*
+/tmp/
