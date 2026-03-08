@@ -62,9 +62,10 @@ class Worker:
 
         # 信号处理 (如果是作为子线程被实例化，例如在 ws_client 中被调用评估风险，则忽略信号注册错误)
         try:
-            signal.signal(signal.SIGTERM, self._handle_signal)
-            signal.signal(signal.SIGINT, self._handle_signal)
-        except ValueError:
+            import signal as _signal
+            _signal.signal(_signal.SIGTERM, self._handle_signal)
+            _signal.signal(_signal.SIGINT, self._handle_signal)
+        except (ValueError, AttributeError):
             pass
 
     def _handle_signal(self, signum, frame):
