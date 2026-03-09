@@ -7,12 +7,12 @@ ModelRouter (模型调度路由器) v33.0
 import os
 import re
 
-# 模型矩阵 (与 Implementation Plan 保持一致)
+# 模型矩阵 (OpenClaw 模型治理后 - 消除 GLM 依赖)
 MODELS = {
     "planner": "qwen3-max-2026-01-23",
     "coder_high": "qwen3-coder-plus",
     "coder_standard": "qwen3.5-plus",
-    "long_context": "glm-5",
+    "long_context": "kimi-k2.5",  # 超长上下文专用
     "prompt_optimizer": "MiniMax-M2.5"
 }
 
@@ -20,9 +20,9 @@ def get_best_model(prompt_text: str, repo_path: str = None) -> str:
     """智能路由逻辑"""
     text_lower = prompt_text.lower()
     
-    # 1. 极长上下文或涉及大规模代码审计 -> glm-5
+    # 1. 极长上下文或涉及大规模代码审计 -> kimi-k2.5 (128K 上下文)
     if len(prompt_text) > 8000 or "审计" in text_lower or "全面分析" in text_lower:
-        return MODELS["long_context"]
+        return MODELS["long_context"]  # kimi-k2.5
     
     # 2. 核心架构逻辑、复杂重构、或明确要求 high-level 思维 -> max 系列
     high_complexity_keywords = ["重构", "架构", "底座", "解耦", "设计模式", "refactor", "architecture"]
