@@ -60,6 +60,15 @@ class TaskStore:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
             conn.executescript(SCHEMA)
+            
+            # v32.6 / v33.0 schema migration
+            cursor = conn.execute("PRAGMA table_info(tasks)")
+            columns = [row[1] for row in cursor.fetchall()]
+            
+            if "repo_path" not in columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN repo_path TEXT")
+            if "model" not in columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN model TEXT")
 
     @contextmanager
     def _connect(self):
