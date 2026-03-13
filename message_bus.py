@@ -7,6 +7,11 @@ from contextlib import contextmanager
 
 DB_PATH = Path("/Users/liufang/zhiwei-dev/messages.db")
 
+# 并发保护参数
+MAX_RETRIES = 3
+RETRY_DELAY = 0.5
+BUSY_TIMEOUT = 30000  # 30秒
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,16 +37,18 @@ class MessageBus:
         self._init_db()
 
     def _init_db(self):
-        with sqlite3.connect(self.db_path, timeout=15.0) as conn:
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT};")
             conn.executescript(SCHEMA)
 
     @contextmanager
     def _connect(self):
-        conn = sqlite3.connect(self.db_path, timeout=15.0)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT};")
         try:
             yield conn
             conn.commit()
@@ -54,13 +61,27 @@ class MessageBus:
     def publish(self, sender: str, topic: str, content: str, metadata: dict = None) -> int:
         import json
         meta_str = json.dumps(metadata, ensure_ascii=False) if metadata else None
-        
-        with self._connect() as conn:
-            cursor = conn.execute(
-                "INSERT INTO messages (sender, topic, content, metadata) VALUES (?, ?, ?, ?)",
-                (sender, topic, content, meta_str)
-            )
-            return cursor.lastrowid
+
+        # 重试机制
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                with self._connect() as conn:
+                    cursor = conn.execute(
+                        "INSERT INTO messages (sender, topic, content, metadata) VALUES (?, ?, ?, ?)",
+                        (sender, topic, content, meta_str)
+                    )
+                    return cursor.lastrowid
+            except sqlite3.OperationalError as e:
+                last_error = e
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+            except Exception as e:
+                last_error = e
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+
+        raise last_error or Exception("MessageBus publish failed after retries")
 
     def consume_pending(self, topic: str = None, limit: int = 10) -> list[dict]:
         with self._connect() as conn:
