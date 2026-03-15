@@ -33,7 +33,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     max_attempts  INTEGER DEFAULT 2,
     progress      TEXT DEFAULT '',
     repo_path     TEXT,     -- v32.6: 支持多仓库协同
-    model         TEXT      -- v33.0: 支持动态模型路由
+    model         TEXT,      -- v33.0: 支持动态模型路由
+
+    -- v34.0: 基于证据的完成机制
+    verify_attempts       INTEGER DEFAULT 0,
+    verify_result         TEXT,
+    acceptance_criteria   TEXT,
+    verification_evidence TEXT,
+    human_confirm_required INTEGER DEFAULT 1,
+    verify_started_at     TEXT,
+    verify_finished_at    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_dependencies (
@@ -69,6 +78,20 @@ class TaskStore:
                 conn.execute("ALTER TABLE tasks ADD COLUMN repo_path TEXT")
             if "model" not in columns:
                 conn.execute("ALTER TABLE tasks ADD COLUMN model TEXT")
+
+            # v34.0: 基于证据的完成机制
+            verify_fields = [
+                ("verify_attempts", "INTEGER DEFAULT 0"),
+                ("verify_result", "TEXT"),
+                ("acceptance_criteria", "TEXT"),
+                ("verification_evidence", "TEXT"),
+                ("human_confirm_required", "INTEGER DEFAULT 1"),
+                ("verify_started_at", "TEXT"),
+                ("verify_finished_at", "TEXT")
+            ]
+            for field, field_type in verify_fields:
+                if field not in columns:
+                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {field} {field_type}")
 
     @contextmanager
     def _connect(self):
@@ -267,6 +290,80 @@ class TaskStore:
                 WHERE status = 'running'
                 AND started_at < ?
             """, (cutoff.strftime("%Y-%m-%d %H:%M:%S"),))
+
+    # ========== v34.0: 基于证据的完成机制 ==========
+
+    MAX_VERIFY_ATTEMPTS = 1  # 最大验证重试次数
+
+    def start_verify(self, task_id: int) -> bool:
+        """标记任务进入验证阶段"""
+        with self._connect() as conn:
+            cursor = conn.execute("""
+                UPDATE tasks SET status = 'verifying',
+                    verify_started_at = datetime('now', 'localtime')
+                WHERE id = ? AND status = 'running'
+            """, (task_id,))
+            return cursor.rowcount > 0
+
+    def verify_fail(self, task_id: int, verify_result: str) -> tuple[bool, bool]:
+        """记录验证失败，返回 (更新成功, 是否允许重试)"""
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            task = conn.execute(
+                "SELECT verify_attempts FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if not task:
+                return False, False
+            current_attempts = task["verify_attempts"]
+            can_retry = current_attempts < self.MAX_VERIFY_ATTEMPTS
+
+            if can_retry:
+                conn.execute("""
+                    UPDATE tasks SET status = 'pending',
+                        verify_attempts = verify_attempts + 1,
+                        verify_result = ?, progress = '验证失败，等待重试'
+                    WHERE id = ?
+                """, (verify_result, task_id))
+            else:
+                conn.execute("""
+                    UPDATE tasks SET status = 'failed',
+                        verify_attempts = verify_attempts + 1,
+                        verify_result = ?, error = ?,
+                        finished_at = datetime('now', 'localtime')
+                    WHERE id = ?
+                """, (verify_result, f"验证失败（已达重试上限）: {verify_result[:200]}", task_id))
+            return True, can_retry
+
+    def await_review(self, task_id: int, verification_evidence: str, acceptance_criteria: str = None) -> bool:
+        """验证通过，等待人工确认"""
+        with self._connect() as conn:
+            cursor = conn.execute("""
+                UPDATE tasks SET status = 'awaiting_review',
+                    verification_evidence = ?, acceptance_criteria = ?,
+                    verify_finished_at = datetime('now', 'localtime')
+                WHERE id = ? AND status = 'verifying'
+            """, (verification_evidence, acceptance_criteria, task_id))
+            return cursor.rowcount > 0
+
+    def accept(self, task_id: int) -> bool:
+        """人工确认通过，标记完成"""
+        with self._connect() as conn:
+            cursor = conn.execute("""
+                UPDATE tasks SET status = 'done',
+                    finished_at = datetime('now', 'localtime')
+                WHERE id = ? AND status = 'awaiting_review'
+            """, (task_id,))
+            return cursor.rowcount > 0
+
+    def reject_with_retry(self, task_id: int, reason: str) -> bool:
+        """人工拒绝，重新执行"""
+        with self._connect() as conn:
+            cursor = conn.execute("""
+                UPDATE tasks SET status = 'pending',
+                    verify_result = ?, progress = '人工拒绝，等待重新执行'
+                WHERE id = ? AND status = 'awaiting_review'
+            """, (f"人工拒绝: {reason}", task_id))
+            return cursor.rowcount > 0
 
 
 # 测试代码

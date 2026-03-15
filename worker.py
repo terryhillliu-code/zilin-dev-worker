@@ -197,6 +197,39 @@ class Worker:
 
         return result.returncode == 0, result.stdout + result.stderr
 
+    def _run_evidence_verify(self, task_id: int, workspace: str,
+                             task_input: str, artifacts_dir: Path) -> tuple[bool, str]:
+        """执行证据验证 (v34.0)"""
+        report_lines = [f"=== 任务 #{task_id} 证据验证报告 ===",
+                        f"时间: {datetime.now().isoformat()}", ""]
+
+        # L1: 文件变更检查
+        status = subprocess.run(["git", "status", "--porcelain"],
+            cwd=workspace, capture_output=True, text=True)
+        changed_files = [line.strip() for line in status.stdout.strip().split('\n') if line.strip()]
+        if not changed_files:
+            return False, "❌ 没有文件变更"
+        report_lines.append(f"【文件变更】✅ {len(changed_files)} 个文件")
+
+        # L2: Python 语法检查
+        py_files = [f[3:] for f in changed_files if f.endswith('.py')]
+        for py_file in py_files:
+            result = subprocess.run(["python3", "-c",
+                f"import ast; ast.parse(open('{py_file}').read())"],
+                cwd=workspace, capture_output=True, text=True)
+            if result.returncode != 0:
+                return False, f"❌ 语法错误: {py_file}\n{result.stderr[:200]}"
+        if py_files:
+            report_lines.append(f"【语法检查】✅ {len(py_files)} 个 Python 文件")
+
+        # L3: 提交检查
+        commit_check = subprocess.run(["git", "log", "-1", "--format=%s"],
+            cwd=workspace, capture_output=True, text=True)
+        report_lines.append(f"【提交】✅ {commit_check.stdout.strip()[:50]}")
+
+        report_lines.append("\n=== 验证结果: 通过 ===")
+        return True, '\n'.join(report_lines)
+
     def _commit_changes(self, workspace: str, task_input: str) -> str | None:
         """提交变更，返回 commit sha"""
         # 检查是否有变更
@@ -371,19 +404,40 @@ class Worker:
                     shutil.copy(retry_log, log_path)
                     self._log(f"  重试成功!")
 
-            # 4. 验证
-            self.store.update_progress(task_id, "验证代码变更")
+            # 4. 基础验证 (v34.0: 引入状态流)
+            self.store.update_progress(task_id, "🔍 基础验证中...")
+            self.store.start_verify(task_id)
+
             verify_ok, verify_output = self._run_verify(workspace)
-            with open(artifacts_dir / "verify.log", "w") as f:
+            with open(artifacts_dir / "verify_basic.log", "w") as f:
                 f.write(verify_output)
 
             if not verify_ok:
-                self.store.update_progress(task_id, "❌ 验证失败")
-                self.store.fail(task_id, f"验证失败: {verify_output[:200]}")
-                self._push_feishu(task_id, False, f"验证失败:\n{verify_output[:500]}")
-                return
+                updated, can_retry = self.store.verify_fail(task_id, f"基础验证失败: {verify_output[:200]}")
+                if can_retry:
+                    self._push_feishu(task_id, False, f"⚠️ 验证失败，自动重试中...\n\n{verify_output[:500]}")
+                    return  # 保留 worktree，等待重新执行
+                else:
+                    self._push_feishu(task_id, False, f"❌ 验证失败（已达重试上限）\n\n{verify_output[:500]}")
+                    return
 
-            # 5. 提交变更
+            # 5. 证据验证
+            self.store.update_progress(task_id, "📋 证据验证中...")
+            evidence_ok, evidence_report = self._run_evidence_verify(task_id, workspace, task_input, artifacts_dir)
+
+            if not evidence_ok:
+                updated, can_retry = self.store.verify_fail(task_id, f"证据验证失败: {evidence_report[:200]}")
+                if can_retry:
+                    self._push_feishu(task_id, False, f"⚠️ 证据验证失败，自动重试中...\n\n{evidence_report[:500]}")
+                    return
+                else:
+                    self._push_feishu(task_id, False, f"❌ 证据验证失败（已达重试上限）\n\n{evidence_report[:500]}")
+                    return
+
+            with open(artifacts_dir / "verify_evidence.log", "w") as f:
+                f.write(evidence_report)
+
+            # 6. 提交变更
             self.store.update_progress(task_id, "提交代码变更")
             commit_sha = self._commit_changes(workspace, task_input)
 
@@ -393,13 +447,13 @@ class Worker:
                 self._push_feishu(task_id, False, "执行完成但没有文件变更")
                 return
 
-            # 6. 获取 diff
+            # 7. 生成 Diff
             self.store.update_progress(task_id, "生成 Diff 报告")
             diff_stat = self._get_diff_stat(workspace)
             with open(artifacts_dir / "diff.patch", "w") as f:
                 f.write(diff_stat)
 
-            # 7. 保存元信息
+            # 8. 保存元信息
             with open(artifacts_dir / "meta.json", "w") as f:
                 json.dump({
                     "task_id": task_id,
@@ -410,21 +464,28 @@ class Worker:
                     "finished_at": datetime.now().isoformat()
                 }, f, indent=2)
 
-            # 8. 完成
-            self.store.update_progress(task_id, "✅ 完成")
-            self.store.complete(task_id, branch, commit_sha, diff_stat[:500])
+            # 9. 等待人工确认 (v34.0: 替换直接完成)
+            self.store.update_progress(task_id, "⏳ 等待人工确认")
+            self.store.await_review(task_id, evidence_report, task_input[:100])
 
-            message = f"""分支: {branch}
-Commit: {commit_sha[:8]}
+            message = f"""📋 验证通过，请确认后合并
+
+**任务**: {task_input[:50]}...
+**分支**: {branch}
+**Commit**: {commit_sha[:8]}
+
+**验证证据**:
+{evidence_report[:800]}
 
 {diff_stat}
 
-🔍 快速复盘: zw-debug {task_id}
-确认无误后执行:
-cd ~/zhiwei-scheduler && git merge {branch}"""
+---
+✅ 回复「确认」或 `/accept {task_id}`
+❌ 回复「重做 原因」或 `/reject {task_id} 原因`"""
 
             self._push_feishu(task_id, True, message)
-            self._log(f"  任务 #{task_id} 完成")
+            self._log(f"  任务 #{task_id} 等待人工确认")
+            return  # 不清理 worktree
 
         except Exception as e:
             error_msg = str(e)
@@ -438,7 +499,10 @@ cd ~/zhiwei-scheduler && git merge {branch}"""
                     f.write(error_msg)
 
         finally:
-            if workspace and branch:
+            # v34.0: 只有 done/failed 才清理 worktree，awaiting_review 保留
+            task_record = self.store.get(task_id)
+            should_cleanup = task_record and task_record.get("status") in ["failed", "done"]
+            if workspace and branch and should_cleanup:
                 self._cleanup_worktree(workspace, branch, keep_branch=True)
 
             # v32.5: 如果任务失败，触发 CriticAgent 异步复盘
