@@ -2,6 +2,9 @@
 tasks.db
 tasks.db-wal
 tasks.db-shm
+messages.db
+messages.db-wal
+messages.db-shm
 
 # 虚拟环境
 venv/
