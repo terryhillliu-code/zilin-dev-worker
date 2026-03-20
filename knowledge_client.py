@@ -1,45 +1,15 @@
 #!/usr/bin/env python3
 """
-知识库客户端 v2 - 深度 RAG 集成
-支持：向量语义搜索 (ChromaDB) + FTS5 全文搜索 (klib.db) + 概念检索 (library.db)
+知识库客户端 v3 - zhiwei-rag 统一接口
+迁移自 v2 (ChromaDB + klib.db) 到 zhiwei-rag (LanceDB + 本地 Embedding)
 """
 import os
 import re
-import sqlite3
 import logging
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
-
-# === 环境配置 (Host Mac 路径) ===
-# library.db: 概念条目与文档元信息
-LIBRARY_DB_PATH = Path(os.environ.get(
-    "KLIB_DB_PATH",
-    os.path.expanduser("~/Documents/clawdbot download/knowledge-library/library.db")
-))
-# klib.db: FTS5 全文搜索（Docker 映射到宿主机的实际路径）
-KLIB_FTS_PATH = Path(os.environ.get(
-    "KLIB_FTS_PATH",
-    os.path.expanduser("~/clawdbot-docker/workspace/data/klib.db")
-))
-# ChromaDB: 向量语义搜索
-CHROMADB_PATH = Path(os.environ.get(
-    "CHROMADB_PATH",
-    os.path.expanduser("~/Documents/clawdbot download/knowledge-library/chromadb")
-))
-
-# Embedding 配置 (复用 OpenClaw DashScope)
-EMBEDDING_API_KEY = os.environ.get(
-    "EMBEDDING_API_KEY",
-    "" # 生产环境严禁硬编码
-)
-EMBEDDING_BASE_URL = os.environ.get(
-    "EMBEDDING_BASE_URL",
-    "https://dashscope.aliyuncs.com/compatible-mode/v1"
-)
-EMBEDDING_MODEL = "text-embedding-v3"
-EMBEDDING_DIMENSION = 1024
 
 # RAG 触发配置 (中英文)
 # 核心技术词：直接触发
@@ -90,292 +60,130 @@ def _extract_keywords(task_input: str) -> list[str]:
     return keywords
 
 
-class EmbeddingCache:
-    """基于 SQLite 的本地 Embedding 缓存，节省百炼额度"""
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
-        self._init_db()
-
-    def _init_db(self):
-        with sqlite3.connect(str(self.db_path)) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS emb_cache (
-                    text_hash TEXT PRIMARY KEY,
-                    text_content TEXT,
-                    embedding_blob BLOB,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-    def get(self, text: str) -> list | None:
-        import hashlib
-        import json
-        text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
-        with sqlite3.connect(str(self.db_path)) as conn:
-            row = conn.execute(
-                "SELECT embedding_blob FROM emb_cache WHERE text_hash = ?",
-                (text_hash,)
-            ).fetchone()
-            if row:
-                return json.loads(row[0])
-        return None
-
-    def set(self, text: str, embedding: list):
-        import hashlib
-        import json
-        text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
-        with sqlite3.connect(str(self.db_path)) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO emb_cache (text_hash, text_content, embedding_blob) VALUES (?, ?, ?)",
-                (text_hash, text, json.dumps(embedding))
-            )
-
-
 class KnowledgeClient:
+    """
+    知识库客户端 v3
+
+    迁移说明：
+    - v2: ChromaDB + klib.db + library.db 三路检索
+    - v3: zhiwei-rag API (LanceDB + 本地 Embedding + Reranker)
+
+    接口保持不变：
+    - should_trigger_rag(task_input) -> bool
+    - get_context(task_input, top_k) -> str
+    """
+
+    # zhiwei-rag 配置
+    RAG_VENV_PYTHON = Path.home() / "zhiwei-rag" / "venv" / "bin" / "python3"
+    RAG_BRIDGE = Path.home() / "zhiwei-rag" / "bridge.py"
+
     def __init__(self):
-        self._chroma_client = None
-        self.cache = EmbeddingCache(Path(__file__).parent / "rag_cache.db")
+        pass  # 无需初始化，使用子进程调用
 
-    def _get_embedding(self, texts: list) -> list:
-        """调用 DashScope 获取 Embedding (带本地缓存)"""
-        # 简单起见，这里只处理包含一个 text 的列表（search_vector 使用场景）
-        if len(texts) == 1:
-            cached = self.cache.get(texts[0])
-            if cached:
-                logger.info(f"✨ Embedding 缓存命中: {texts[0][:20]}...")
-                return [cached]
-
-        try:
-            import requests
-        except ImportError:
-            logger.warning("requests 模块未安装，无法获取 embedding")
-            return []
-
-        resp = requests.post(
-            f"{EMBEDDING_BASE_URL}/embeddings",
-            headers={"Authorization": f"Bearer {EMBEDDING_API_KEY}", "Content-Type": "application/json"},
-            json={"model": EMBEDDING_MODEL, "input": texts, "dimension": EMBEDDING_DIMENSION},
-            timeout=30
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        embeddings = [item["embedding"] for item in sorted(data["data"], key=lambda x: x["index"])]
-        
-        # 存入缓存
-        if len(texts) == 1 and embeddings:
-            self.cache.set(texts[0], embeddings[0])
-            
-        return embeddings
-
-    # ----- 搜索层 1: 概念检索 (library.db) -----
-    def search_concepts(self, query: str, top_k: int = 3) -> list[dict]:
-        """在 library.db 的 knowledge_items 中搜索概念条目"""
-        if not LIBRARY_DB_PATH.exists():
-            logger.debug(f"library.db 不存在: {LIBRARY_DB_PATH}")
-            return []
-
-        conn = sqlite3.connect(str(LIBRARY_DB_PATH))
-        conn.row_factory = sqlite3.Row
-        try:
-            results = []
-            cursor = conn.execute("""
-                SELECT concept, explanation
-                FROM knowledge_items
-                WHERE concept LIKE ? OR explanation LIKE ?
-                LIMIT ?
-            """, (f"%{query}%", f"%{query}%", top_k))
-            for r in cursor.fetchall():
-                results.append({"title": r[0], "content": r[1], "source": "concept"})
-
-            if len(results) < top_k:
-                cursor = conn.execute("""
-                    SELECT title, description
-                    FROM documents
-                    WHERE title LIKE ? OR description LIKE ?
-                    LIMIT ?
-                """, (f"%{query}%", f"%{query}%", top_k - len(results)))
-                for r in cursor.fetchall():
-                    results.append({"title": r[0], "content": r[1] or "", "source": "document"})
-
-            return results
-        except Exception as e:
-            logger.warning(f"概念检索错误: {e}")
-            return []
-        finally:
-            conn.close()
-
-    # ----- 搜索层 2: FTS5 全文搜索 (klib.db) -----
-    def search_fts(self, query: str, top_k: int = 3) -> list[dict]:
-        """在 klib.db 中执行 FTS5 全文搜索"""
-        if not KLIB_FTS_PATH.exists():
-            logger.debug(f"klib.db 不存在: {KLIB_FTS_PATH}")
-            return []
-
-        conn = sqlite3.connect(str(KLIB_FTS_PATH))
-        conn.row_factory = sqlite3.Row
-        try:
-            # 检查 FTS5 表是否存在
-            cursor = conn.execute("""
-                SELECT name FROM sqlite_master
-                WHERE type='table' AND name = 'books_fts'
-            """)
-            has_fts = cursor.fetchone() is not None
-
-            results = []
-            if has_fts:
-                safe_query = f'"{query}"'
-                cursor = conn.execute("""
-                    SELECT title, author, toc, summary
-                    FROM books_fts
-                    WHERE books_fts MATCH ?
-                    ORDER BY rank
-                    LIMIT ?
-                """, (safe_query, top_k))
-                for r in cursor.fetchall():
-                    content = f"作者: {r[1] or ''}\n目录: {r[2] or ''}\n摘要: {r[3] or ''}"
-                    results.append({"title": r[0], "content": content, "source": "fts5"})
-
-            # FTS5 无结果时回退到 LIKE
-            if not results:
-                cursor = conn.execute("""
-                    SELECT title, file_path, category
-                    FROM books
-                    WHERE title LIKE ? OR category LIKE ?
-                    LIMIT ?
-                """, (f"%{query}%", f"%{query}%", top_k))
-                for r in cursor.fetchall():
-                    results.append({
-                        "title": r[0],
-                        "content": f"路径: {r[1]}\n分类: {r[2]}",
-                        "source": "keyword"
-                    })
-
-            return results
-        except Exception as e:
-            logger.warning(f"FTS5 搜索错误: {e}")
-            return []
-        finally:
-            conn.close()
-
-    # ----- 搜索层 3: 向量语义搜索 (ChromaDB) -----
-    def search_vector(self, query: str, top_k: int = 3) -> list[dict]:
-        """ChromaDB 语义搜索"""
-        try:
-            import chromadb
-        except ImportError:
-            logger.debug("chromadb 未安装，跳过向量搜索")
-            return []
-
-        if not CHROMADB_PATH.exists():
-            logger.debug(f"ChromaDB 目录不存在: {CHROMADB_PATH}")
-            return []
-
-        if self._chroma_client is None:
-            self._chroma_client = chromadb.PersistentClient(path=str(CHROMADB_PATH))
-
-        try:
-            collection = self._chroma_client.get_collection("knowledge_base")
-            if collection.count() == 0:
-                return []
-
-            query_embedding = self._get_embedding([query])
-            if not query_embedding:
-                return []
-
-            results = collection.query(
-                query_embeddings=[query_embedding[0]],
-                n_results=min(top_k, collection.count()),
-                include=["documents", "metadatas", "distances"]
-            )
-
-            items = []
-            if results and results["documents"] and results["documents"][0]:
-                for i, doc_text in enumerate(results["documents"][0]):
-                    meta = results["metadatas"][0][i] if results["metadatas"] else {}
-                    distance = results["distances"][0][i] if results["distances"] else 0
-                    score = round(1 - distance, 4)
-                    # 只保留相关性 > 0.3 的结果
-                    if score > 0.3:
-                        items.append({
-                            "title": meta.get("title", "未知"),
-                            "content": doc_text,
-                            "score": score,
-                            "source": "vector"
-                        })
-            return items
-        except Exception as e:
-            logger.warning(f"向量搜索错误: {e}")
-            return []
-
-    # ----- 综合检索入口 -----
     def should_trigger_rag(self, task_input: str) -> bool:
         """判断任务是否需要触发 RAG 检索 (P1 优化版)"""
         task_lower = task_input.lower()
-        
+
         # 1. 包含核心技术词：直接触发
         if any(kw in task_lower for kw in CORE_TECHNICAL):
             return True
-        
+
         # 2. 只有包含启发式词汇 且 长度达到阈值时 才触发
         if len(task_input) >= RAG_TRIGGER_MIN_LENGTH:
             if any(kw in task_lower for kw in GENERIC_HEURISTIC):
                 return True
-                
+
         return False
 
     def get_context(self, task_input: str, top_k: int = 3) -> str:
         """
-        三路召回 + 去重 + 格式化输出。
-        返回可直接拼接到 Prompt 中的上下文字符串。
+        通过 zhiwei-rag bridge 子进程检索知识库上下文。
+
+        Args:
+            task_input: 任务描述
+            top_k: 返回结果数量
+
+        Returns:
+            格式化的上下文字符串，可直接拼接到 Prompt 中
         """
+        if not self.RAG_VENV_PYTHON.exists() or not self.RAG_BRIDGE.exists():
+            logger.warning("zhiwei-rag 环境不存在，返回空上下文")
+            return ""
+
         keywords = _extract_keywords(task_input)
         logger.info(f"RAG 提取关键词: {keywords}")
 
-        all_results = []
-        seen_titles = set()
+        try:
+            # 使用关键词作为查询
+            query_text = " ".join(keywords[:3])
 
-        for kw in keywords[:3]:  # 最多取前 3 个关键词搜索
-            # 层1: 概念检索
-            for r in self.search_concepts(kw, top_k=2):
-                if r["title"] not in seen_titles:
-                    seen_titles.add(r["title"])
-                    all_results.append(r)
+            # 通过子进程调用 bridge.py
+            import subprocess
+            import json
 
-            # 层2: FTS5 全文搜索
-            for r in self.search_fts(kw, top_k=2):
-                if r["title"] not in seen_titles:
-                    seen_titles.add(r["title"])
-                    all_results.append(r)
+            result = subprocess.run(
+                [
+                    str(self.RAG_VENV_PYTHON),
+                    str(self.RAG_BRIDGE),
+                    "retrieve",
+                    query_text,
+                    "--top-k", str(top_k)
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=str(self.RAG_BRIDGE.parent)
+            )
 
-        # 层3: 向量搜索（使用原始任务描述，语义更完整）
-        query_text = " ".join(keywords[:3])
-        for r in self.search_vector(query_text, top_k=top_k):
-            if r["title"] not in seen_titles:
-                seen_titles.add(r["title"])
-                all_results.append(r)
+            if result.returncode != 0:
+                logger.warning(f"RAG 检索失败: {result.stderr}")
+                return ""
 
-        if not all_results:
+            # 解析 JSON 输出
+            try:
+                results = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                logger.warning(f"RAG 输出解析失败: {result.stdout[:100]}")
+                return ""
+
+            if not results:
+                return ""
+
+            # 格式化输出（兼容 v2 格式）
+            context = "\n=== [Reference Knowledge from zhiwei-rag] ===\n"
+            for r in results:
+                text = r.get('text', '') or r.get('raw_text', '')
+                source = r.get('source', 'unknown')
+                track = r.get('track', 'vector')
+                score = r.get('score', 0)
+
+                # 截断过长的文本
+                content_preview = text[:400] if text else ""
+
+                source_label = {
+                    "vector": "语义搜索",
+                    "fts": "全文检索",
+                    "graph": "知识图谱"
+                }.get(track, track)
+
+                score_str = f" (相关度: {score:.4f})" if score else ""
+
+                # 尝试提取标题
+                title = source if source != "unknown" else "知识库条目"
+                if len(content_preview) > 20:
+                    title = content_preview[:30].replace("\n", " ") + "..."
+
+                context += f"\n📖 {title} [{source_label}{score_str}]\n"
+                context += f"{content_preview}\n---\n"
+
+            return context
+
+        except subprocess.TimeoutExpired:
+            logger.warning("RAG 检索超时 (30s)")
             return ""
-
-        # 按 score 排序（有 score 的优先）
-        all_results.sort(key=lambda x: x.get("score", 0.5), reverse=True)
-
-        # 格式化输出
-        context = "\n=== [Reference Knowledge from OpenClaw] ===\n"
-        for r in all_results[:top_k]:
-            source_label = {
-                "concept": "概念库", "document": "文档库",
-                "fts5": "全文检索", "keyword": "关键词",
-                "vector": "语义搜索"
-            }.get(r["source"], r["source"])
-
-            content_preview = r["content"][:400] if r.get("content") else ""
-            score_str = f" (相关度: {r['score']})" if "score" in r else ""
-
-            context += f"\n📖 {r.get('title', 'Untitled')} [{source_label}{score_str}]\n"
-            context += f"{content_preview}\n---\n"
-
-        return context
+        except Exception as e:
+            logger.warning(f"RAG 检索失败: {e}")
+            return ""
 
 
 if __name__ == "__main__":
@@ -392,11 +200,16 @@ if __name__ == "__main__":
         kw = _extract_keywords(inp)
         print(f"  输入: {inp[:40]}... -> 关键词: {kw}")
 
-    print("\n=== 测试概念搜索 ===")
-    print(client.search_concepts("架构"))
-
-    print("\n=== 测试 FTS5 搜索 ===")
-    print(client.search_fts("agent"))
+    print("\n=== 测试 RAG 触发判断 ===")
+    test_cases = [
+        ("帮我修改 API 接口", True),
+        ("写一个简单的 hello world", False),
+        ("请帮我设计一个新的 API 接口用于任务调度系统架构优化", True),
+    ]
+    for inp, expected in test_cases:
+        result = client.should_trigger_rag(inp)
+        status = "✅" if result == expected else "❌"
+        print(f"  {status} '{inp[:30]}...' -> {result}")
 
     print("\n=== 测试综合检索 ===")
     ctx = client.get_context("请帮我设计一个新的 API 接口用于任务调度")
