@@ -5,6 +5,10 @@ tasks.db-shm
 messages.db
 messages.db-wal
 messages.db-shm
+message_log.db
+rag_cache.db
+video_history.db
+offline_state.json
 
 # 虚拟环境
 venv/
