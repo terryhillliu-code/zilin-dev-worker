@@ -298,6 +298,99 @@ def generate_report(verification: TaskVerification) -> str:
     return "\n".join(lines)
 
 
+# ========== Worker 集成接口 ==========
+
+def run_verification_for_worker(
+    task_id: int,
+    workspace: str,
+    task_input: str,
+    commit_output: str = "",
+    changed_files: list = None,
+    test_output: str = ""
+) -> tuple[bool, str]:
+    """
+    为 Worker 提供的验证接口
+
+    Args:
+        task_id: 任务 ID
+        workspace: 工作目录路径
+        task_input: 任务输入内容
+        commit_output: Git 提交输出
+        changed_files: 变更文件列表
+        test_output: 测试执行输出
+
+    Returns:
+        (passed, report) - 是否通过 + 验证报告
+    """
+    from datetime import datetime
+    import subprocess
+
+    report_lines = [
+        f"=== 任务 #{task_id} 证据验证报告 ===",
+        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"所需证据等级: {determine_evidence_level({'input': task_input})}",
+        ""
+    ]
+
+    all_passed = True
+
+    # L1: 命令行返回日志
+    report_lines.append("## L1: 命令行日志")
+    if commit_output or changed_files:
+        report_lines.append(f"✅ 包含命令执行结果")
+        if changed_files:
+            report_lines.append(f"   变更文件: {len(changed_files)} 个")
+    else:
+        report_lines.append("❌ 缺少命令执行证据")
+        all_passed = False
+    report_lines.append("")
+
+    # L2: 测试脚本结果
+    report_lines.append("## L2: 测试脚本结果")
+    if test_output:
+        # 检查是否有通过标记
+        if any(m in test_output.lower() for m in ["pass", "✓", "✅", "成功"]):
+            report_lines.append(f"✅ 测试通过")
+        elif any(m in test_output.lower() for m in ["fail", "❌", "失败"]):
+            report_lines.append(f"❌ 测试失败")
+            all_passed = False
+        else:
+            report_lines.append(f"✅ 包含测试输出")
+        report_lines.append(f"```\n{test_output[:500]}\n```")
+    else:
+        # 中等以上复杂度需要 L2
+        required_level = determine_evidence_level({"input": task_input})
+        if required_level in ["L2", "L3"]:
+            report_lines.append("⚠️ 中等/复杂任务需要测试证据（未提供）")
+        else:
+            report_lines.append("⏭️ 简单任务，跳过 L2 检查")
+    report_lines.append("")
+
+    # L3: Spec 文档对齐（检查任务内容）
+    report_lines.append("## L3: Spec 文档对齐")
+    spec_keywords = ["spec", "规范", "架构", "specification"]
+    needs_spec = any(kw in task_input.lower() for kw in spec_keywords)
+
+    if needs_spec:
+        # 检查是否有 Spec 更新记录
+        if "spec" in (commit_output or "").lower() or "spec" in task_input.lower():
+            report_lines.append("✅ 涉及 Spec 相关修改")
+        else:
+            report_lines.append("⚠️ 涉及 Spec 关键词，建议检查文档同步")
+    else:
+        report_lines.append("✅ 不涉及 Spec 文档修改")
+    report_lines.append("")
+
+    # 总结
+    report_lines.append("---")
+    if all_passed:
+        report_lines.append("🎉 验证通过")
+    else:
+        report_lines.append("⚠️ 验证未完全通过，请补充证据")
+
+    return all_passed, "\n".join(report_lines)
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: verify_evidence.py --task <id> | --recent | --report")

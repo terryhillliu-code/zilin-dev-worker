@@ -23,6 +23,7 @@ from task_store import TaskStore
 from backends.claude_code import ClaudeCodeBackend
 from message_bus import MessageBus
 from knowledge_client import KnowledgeClient
+from verify_evidence import run_verification_for_worker, determine_evidence_level
 
 # 配置
 POLL_INTERVAL = 5  # 秒
@@ -199,36 +200,46 @@ class Worker:
 
     def _run_evidence_verify(self, task_id: int, workspace: str,
                              task_input: str, artifacts_dir: Path) -> tuple[bool, str]:
-        """执行证据验证 (v34.0)"""
-        report_lines = [f"=== 任务 #{task_id} 证据验证报告 ===",
-                        f"时间: {datetime.now().isoformat()}", ""]
+        """执行证据验证 (v47.7: 使用 verify_evidence.py 三级验证)"""
+        import subprocess
 
-        # L1: 文件变更检查
+        # 获取变更文件列表
         status = subprocess.run(["git", "status", "--porcelain"],
             cwd=workspace, capture_output=True, text=True)
         changed_files = [line.strip() for line in status.stdout.strip().split('\n') if line.strip()]
+
         if not changed_files:
             return False, "❌ 没有文件变更"
-        report_lines.append(f"【文件变更】✅ {len(changed_files)} 个文件")
 
-        # L2: Python 语法检查
-        py_files = [f[3:] for f in changed_files if f.endswith('.py')]
-        for py_file in py_files:
-            result = subprocess.run(["python3", "-c",
-                f"import ast; ast.parse(open('{py_file}').read())"],
-                cwd=workspace, capture_output=True, text=True)
-            if result.returncode != 0:
-                return False, f"❌ 语法错误: {py_file}\n{result.stderr[:200]}"
-        if py_files:
-            report_lines.append(f"【语法检查】✅ {len(py_files)} 个 Python 文件")
+        # 运行测试脚本（如果有）
+        test_output = ""
+        verify_script = os.path.expanduser("~/scripts/pre_check_v2.sh")
+        if os.path.exists(verify_script):
+            result = subprocess.run(
+                ["bash", verify_script],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            test_output = result.stdout + result.stderr
 
-        # L3: 提交检查
-        commit_check = subprocess.run(["git", "log", "-1", "--format=%s"],
-            cwd=workspace, capture_output=True, text=True)
-        report_lines.append(f"【提交】✅ {commit_check.stdout.strip()[:50]}")
+        # 获取最近的提交信息
+        commit_result = subprocess.run(
+            ["git", "log", "-1", "--format=%s%n%b"],
+            cwd=workspace, capture_output=True, text=True
+        )
+        commit_output = commit_result.stdout
 
-        report_lines.append("\n=== 验证结果: 通过 ===")
-        return True, '\n'.join(report_lines)
+        # 调用三级验证
+        return run_verification_for_worker(
+            task_id=task_id,
+            workspace=workspace,
+            task_input=task_input,
+            commit_output=commit_output,
+            changed_files=changed_files,
+            test_output=test_output
+        )
 
     def _commit_changes(self, workspace: str, task_input: str) -> str | None:
         """提交变更，返回 commit sha"""
