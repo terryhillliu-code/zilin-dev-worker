@@ -107,7 +107,7 @@ class TaskStore:
         finally:
             conn.close()
 
-    def enqueue(self, task_input: str, message_id: str = None, initial_status: str = 'pending', depends_on: list[int] = None, **kwargs) -> int:
+    def enqueue(self, task_input: str, message_id: str = None, initial_status: str = 'pending', depends_on: list[int] = None, backend: str = 'claude', **kwargs) -> int:
         """入队任务，返回 task_id。message_id 用于幂等去重"""
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
@@ -120,8 +120,8 @@ class TaskStore:
                     return existing["id"]
 
             cursor = conn.execute(
-                "INSERT INTO tasks (input, message_id, status, repo_path, model) VALUES (?, ?, ?, ?, ?)",
-                (task_input, message_id, initial_status, kwargs.get('repo_path'), kwargs.get('model'))
+                "INSERT INTO tasks (input, message_id, status, repo_path, model, backend) VALUES (?, ?, ?, ?, ?, ?)",
+                (task_input, message_id, initial_status, kwargs.get('repo_path'), kwargs.get('model'), backend)
             )
             task_id = cursor.lastrowid
             
@@ -133,13 +133,13 @@ class TaskStore:
                 
             return task_id
 
-    def claim_next(self) -> dict | None:
+    def claim_next(self, backend: str = 'claude') -> dict | None:
         """认领下一个 pending 任务，标记为 running"""
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             task = conn.execute("""
                 SELECT * FROM tasks
-                WHERE status = 'pending' AND attempts < max_attempts
+                WHERE status = 'pending' AND attempts < max_attempts AND backend = ?
                 AND id NOT IN (
                     SELECT task_id FROM task_dependencies
                     JOIN tasks AS parent ON parent.id = task_dependencies.depends_on_id
@@ -147,7 +147,7 @@ class TaskStore:
                 )
                 ORDER BY created_at ASC
                 LIMIT 1
-            """).fetchone()
+            """, (backend,)).fetchone()
 
             if not task:
                 return None
