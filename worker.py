@@ -19,6 +19,14 @@ from concurrent.futures import ThreadPoolExecutor
 # 添加项目路径
 sys.path.insert(0, str(Path(__file__).parent))
 
+# 加载全局密钥
+sys.path.insert(0, str(Path.home() / "scripts"))
+try:
+    from load_secrets import load_secrets
+    load_secrets(silent=True)
+except ImportError:
+    pass
+
 from task_store import TaskStore
 from backends.claude_code import ClaudeCodeBackend
 from message_bus import MessageBus
