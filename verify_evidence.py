@@ -57,8 +57,12 @@ class TaskVerification:
 
 def get_task_store():
     """获取 TaskStore 实例"""
-    sys.path.insert(0, str(Path.home() / "zhiwei-dev"))
-    from task_store import TaskStore
+    # v5.9: 优先使用 .pth 配置，回退到 sys.path.insert
+    try:
+        from task_store import TaskStore
+    except ImportError:
+        sys.path.insert(0, str(Path.home() / "zhiwei-dev"))
+        from task_store import TaskStore
     return TaskStore()
 
 

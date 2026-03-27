@@ -24,10 +24,14 @@ except ImportError:
     print("错误: 需要安装 openai 库. (pip install openai)")
     sys.exit(1)
 
-# 添加环境变量
-sys.path.insert(0, str(Path(__file__).parent))
-from knowledge_client import KnowledgeClient
-from model_router import get_best_model
+# v5.9: 优先使用 .pth 配置，回退到 sys.path.insert
+try:
+    from knowledge_client import KnowledgeClient
+    from model_router import get_best_model
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from knowledge_client import KnowledgeClient
+    from model_router import get_best_model
 
 # 模型矩阵配置 (Phase 4.4.2 & 4.5.1)
 MODEL_PLANNER = "qwen3-max-2026-01-23"  # 顶级规划
