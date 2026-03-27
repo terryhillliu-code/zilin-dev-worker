@@ -271,6 +271,9 @@ class Worker:
         )
         commit_output = commit_result.stdout
 
+        # v5.9: test_output 默认为空（暂无测试执行）
+        test_output = ""
+
         # 调用三级验证
         return run_verification_for_worker(
             task_id=task_id,
