@@ -53,11 +53,11 @@ class ClaudeCodeBackend(DevBackend):
         
         # v5.6.1: 核心变更 - 在大脑容器内执行 Chief Engineer 任务
         # 使用 npx -y 确保即便没有全局安装也能直接运行
-        # 3. 构造 Docker 命令
-        task_safe = final_task.replace('"', '\\"')
-        
+        # v5.7: 修复 --print 模式，通过 stdin 传入任务
         # 使用 bash -c 封装以获得更好的参数处理稳定性
-        inner_cmd = f"npx -y @anthropic-ai/claude-code --dangerously-skip-permissions --allowedTools Edit,Write,Read,Terminal,Search \"{task_safe}\""
+        task_safe = final_task.replace("'", "'\"'\"'")  # 单引号转义
+
+        inner_cmd = f"echo '{task_safe}' | npx -y @anthropic-ai/claude-code --dangerously-skip-permissions --allowedTools Edit,Write,Read,Terminal,Search --print"
         
         cmd = [
             "docker", "exec",
