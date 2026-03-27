@@ -27,7 +27,8 @@ ARTIFACTS_BASE = Path(__file__).parent / "artifacts"
 
 # 百炼 API 配置 (Phase 4.4.1: 使用顶级推理模型)
 MODEL_CRITIC = "qwen3-max-2026-01-23"
-ANTHROPIC_AUTH_TOKEN = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+# 使用统一加载后的环境变量 (v57.0)
+DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 ANTHROPIC_BASE_URL = "https://coding.dashscope.aliyuncs.com/v1"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -35,9 +36,9 @@ logger = logging.getLogger(__name__)
 
 class CriticAgent:
     def __init__(self):
-        self.api_key = ANTHROPIC_AUTH_TOKEN
+        self.api_key = DASHSCOPE_API_KEY
         if not self.api_key:
-            logger.error("环境变量 ANTHROPIC_AUTH_TOKEN 未设置")
+            logger.error("环境变量 DASHSCOPE_API_KEY 未设置")
         
         self.client = OpenAI(
             api_key=self.api_key,

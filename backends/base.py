@@ -15,7 +15,8 @@ class ExecuteResult:
 class DevBackend(ABC):
 
     @abstractmethod
-    def execute(self, task: str, workspace: str, log_path: str) -> ExecuteResult:
+    def execute(self, task: str, workspace: str, log_path: str, 
+                model_override: str = None, retry_context: str = None) -> ExecuteResult:
         """
         在指定 workspace 中执行开发任务
 

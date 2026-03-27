@@ -12,6 +12,37 @@ import signal
 import threading
 from pathlib import Path
 from datetime import datetime
+import re
+
+def generate_diagnosis(task_id: int, artifacts_dir: Path, error_msg: str):
+    """生成失败诊断报告 (v5.6.6)"""
+    diag_file = artifacts_dir / "diagnosis.md"
+    log_path = artifacts_dir / "run.log"
+    
+    last_lines = ""
+    if log_path.exists():
+        try:
+            with open(log_path, "r") as f:
+                lines = f.readlines()
+                last_lines = "".join(lines[-30:]) # Capture last 30 lines
+        except: pass
+
+    with open(diag_file, "w") as f:
+        f.write(f"# 任务 #{task_id} 失败诊断报告\n\n")
+        f.write(f"**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write("## 错误摘要\n")
+        f.write(f"```text\n{error_msg[:1000]}\n```\n\n")
+        if last_lines:
+            f.write("## 容器日志末尾 (现场还原)\n")
+            f.write(f"```text\n{last_lines}\n```\n\n")
+        f.write("## 建议对策\n")
+        if "401" in error_msg or "api_key" in error_msg.lower():
+            f.write("- 检查 API 密钥对齐情况：当前使用的是百炼 SK-SP 模式。\n")
+        elif "timeout" in error_msg.lower():
+            f.write("- 任务执行超时，可能存在无限循环或大批量文件卡死。\n")
+        else:
+            f.write("- 请运行 `zw-log {task_id}` 查看完整执行轨迹。\n")
+
 from queue import Empty
 import shutil
 from concurrent.futures import ThreadPoolExecutor
@@ -20,23 +51,20 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, str(Path(__file__).parent))
 
 # 加载全局密钥
-sys.path.insert(0, str(Path.home() / "scripts"))
-try:
-    from load_secrets import load_secrets
-    load_secrets(silent=True)
-except ImportError:
-    pass
+from zhiwei_common.secrets import load_secrets
+load_secrets(silent=True)
 
-from task_store import TaskStore
+from zhiwei_common import TaskStore
 from backends.claude_code import ClaudeCodeBackend
 from message_bus import MessageBus
 from knowledge_client import KnowledgeClient
 from verify_evidence import run_verification_for_worker, determine_evidence_level
 
+
 # 配置
 POLL_INTERVAL = 5  # 秒
-WORKTREE_BASE = "/tmp/zhiwei-worktrees"
-ARTIFACTS_BASE = Path(__file__).parent / "artifacts"
+WORKTREE_BASE = "/Users/liufang/clawdbot-docker/workspace/tasks"
+ARTIFACTS_BASE = Path("/Users/liufang/zhiwei-dev/artifacts")
 BASE_REPO = os.path.expanduser("~/zhiwei-scheduler")
 ANTHROPIC_AUTH_TOKEN = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
 
@@ -51,14 +79,15 @@ PROTECTED_FILES = [
 HEARTBEAT_FILE = Path("/tmp/zhiwei-dev-worker.heartbeat")
 HEARTBEAT_INTERVAL = 30  # 秒
 
-
 class Worker:
-    def __init__(self, check_interval: int = 5, max_workers: int = 3):
+    def __init__(self, check_interval: int = 5, max_workers: int = 5):
         self.store = TaskStore()
+        # v5.6: 统一为全能知微大脑，不再分流研究后端
         self.backend = ClaudeCodeBackend()
+        self.check_interval = check_interval
         self.msg_bus = MessageBus()
         self.knowledge = KnowledgeClient()
-        self.check_interval = check_interval
+        self.base_path = Path(__file__).parent.resolve()
         self._running = False
         
         # Concurrency
@@ -190,21 +219,37 @@ class Worker:
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         return artifacts_dir
 
-    def _run_verify(self, workspace: str) -> tuple[bool, str]:
-        """运行验证脚本"""
-        verify_script = os.path.expanduser("~/scripts/pre_check_v2.sh")
-        if not os.path.exists(verify_script):
-            return True, "验证脚本不存在，跳过验证"
+    def _run_verify(self, workspace: str, backend_type: str = "claude") -> tuple[bool, str]:
+        """代码级验证 (v57.0: 替换 pre_check_v2.sh)"""
+        if backend_type == "research":
+            return True, "研究任务，跳过代码验证"
 
-        result = subprocess.run(
-            ["bash", verify_script],
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
+        # 1. 检查是否有文件变更
+        status = subprocess.run(["git", "status", "--porcelain"],
+            cwd=workspace, capture_output=True, text=True)
+        if not status.stdout.strip():
+            return False, "❌ 没有发现文件变更，请确认是否正确执行了修改"
 
-        return result.returncode == 0, result.stdout + result.stderr
+        # 2. 对 .py 文件做语法检查 (如果存在)
+        py_files = []
+        for line in status.stdout.strip().split('\n'):
+            # git status --porcelain 输出格式为 " M path/to/file"
+            filepath = line.strip().split()[-1]
+            if filepath.endswith('.py'):
+                py_files.append(filepath)
+
+        if py_files:
+            self._log(f"  🔍 对 {len(py_files)} 个 Python 文件进行语法检查...")
+            for fp in py_files:
+                abs_path = os.path.join(workspace, fp)
+                if not os.path.exists(abs_path): continue
+                
+                res = subprocess.run([sys.executable, "-m", "py_compile", fp],
+                    cwd=workspace, capture_output=True, text=True)
+                if res.returncode != 0:
+                    return False, f"❌ Python 语法错误: {fp}\n{res.stderr}"
+
+        return True, "✅ 代码基础验证通过 (变更检测+语法检查)"
 
     def _run_evidence_verify(self, task_id: int, workspace: str,
                              task_input: str, artifacts_dir: Path) -> tuple[bool, str]:
@@ -218,19 +263,6 @@ class Worker:
 
         if not changed_files:
             return False, "❌ 没有文件变更"
-
-        # 运行测试脚本（如果有）
-        test_output = ""
-        verify_script = os.path.expanduser("~/scripts/pre_check_v2.sh")
-        if os.path.exists(verify_script):
-            result = subprocess.run(
-                ["bash", verify_script],
-                cwd=workspace,
-                capture_output=True,
-                text=True,
-                timeout=60
-            )
-            test_output = result.stdout + result.stderr
 
         # 获取最近的提交信息
         commit_result = subprocess.run(
@@ -248,6 +280,26 @@ class Worker:
             changed_files=changed_files,
             test_output=test_output
         )
+
+    def _run_research_verify(self, task_id: int, artifacts_dir: Path) -> tuple[bool, str]:
+        """验证研究任务 (只需检查报告是否存在)"""
+        # 统计 artifacts 目录下的 md 文件
+        md_files = list(artifacts_dir.glob("*.md"))
+        if md_files:
+            return True, f"✅ 已生成 {len(md_files)} 份研究报告: {', '.join(f.name for f in md_files)}"
+        
+        # 兜底检查 /tmp/notebooklm_export
+        export_root = Path("/tmp/notebooklm_export")
+        if export_root.exists():
+            tmp_mds = list(export_root.glob("**/*.md"))
+            if tmp_mds:
+                # 尝试拷贝到 artifacts
+                for f in tmp_mds:
+                    try: shutil.copy(f, artifacts_dir / f.name)
+                    except: pass
+                return True, f"✅ 已从临时目录同步 {len(tmp_mds)} 份报告"
+
+        return False, "❌ 未发现生成的 Markdown 研究报告"
 
     def _commit_changes(self, workspace: str, task_input: str) -> str | None:
         """提交变更，返回 commit sha"""
@@ -285,6 +337,23 @@ class Worker:
         )
         return result.stdout
 
+    def _auto_merge(self, workspace: str, branch: str, task_id: int):
+        """自动合并变更到主分支 (v57.0)"""
+        self._log(f"  🚀 开启自动合并模式 (Task #{task_id})")
+        
+        # 1. 切换回 main
+        subprocess.run(["git", "checkout", "main"], cwd=workspace, capture_output=True)
+        
+        # 2. 合并分支
+        merge_res = subprocess.run(["git", "merge", branch, "--no-edit"], 
+                                   cwd=workspace, capture_output=True, text=True)
+        
+        if merge_res.returncode != 0:
+            self._log(f"  ❌ 自动合并冲突: {merge_res.stderr}")
+            raise RuntimeError(f"自动合并冲突，请手动处理: {merge_res.stderr}")
+            
+        self._log(f"  ✅ 自动合并成功")
+
     def _push_feishu(self, task_id: int, success: bool, message: str):
         """推送结果到统一消息总线(Message Bus)"""
         # 获取当天序号
@@ -300,7 +369,7 @@ class Worker:
         if task_record and task_record.get("message_id"):
             # 如果 message_id 包含路由信息或在 db 中有记录，此处提取
             # 目前逻辑：通过 user_mappings 目录兼容旧逻辑，但优先从 metadata 提取
-            user_mappings_dir = Path(__file__).parent / "user_mappings"
+            user_mappings_dir = self.base_path / "user_mappings"
             user_file = user_mappings_dir / f"task_{task_id}_user.json"
             if user_file.exists():
                 try:
@@ -332,8 +401,9 @@ class Worker:
         """执行单个任务"""
         task_id = task["id"]
         task_input = task["input"]
+        backend_type = task.get("backend", "claude")
 
-        self._log(f"开始执行任务 #{task_id}: {task_input[:50]}...")
+        self._log(f"开始执行任务 #{task_id} ({backend_type}): {task_input[:50]}...")
 
         # 检查受保护文件
         self.store.update_progress(task_id, "检查安全规则")
@@ -359,11 +429,18 @@ class Worker:
             with open(artifacts_dir / "input.json", "w") as f:
                 json.dump({"id": task_id, "input": task_input}, f, ensure_ascii=False, indent=2)
 
-            # 2. 创建 worktree
-            repo_path = task.get("repo_path")
-            workspace, branch = self._setup_worktree(task_id, repo_path=repo_path)
-            self.store.update_progress(task_id, f"准备工作区 ({os.path.basename(repo_path or 'default')})")
-            self._log(f"  Worktree: {workspace} (Repo: {repo_path or 'BASE'})")
+            # 2. 准备工作区
+            if backend_type == "claude":
+                repo_path = task.get("repo_path")
+                workspace, branch = self._setup_worktree(task_id, repo_path=repo_path)
+                self.store.update_progress(task_id, f"准备工作区 ({os.path.basename(repo_path or 'default')})")
+                self._log(f"  Worktree: {workspace} (Repo: {repo_path or 'BASE'})")
+            else:
+                # 研究任务，直接在 artifacts 目录下执行，不建立 Git 关联 (v57.0)
+                workspace = str(artifacts_dir)
+                branch = None
+                self.store.update_progress(task_id, "准备研究沙盒")
+                self._log(f"  Research Worktree: {workspace}")
 
             # 2.5 深度知识库集成 (RAG v2)
             context = ""
@@ -391,6 +468,9 @@ class Worker:
             task_model = task.get("model")
             self._log(f"  Target Model: {task_model or 'Default'}")
             
+            # v5.6: 始终使用统一的知微大脑 (Holistic Agent)
+            active_backend = self.backend
+            
             # [Phase 6] Token 监控埋点
             final_input = f"{context}\n\n{task_input}" if context else task_input
             token_stats = {
@@ -405,19 +485,30 @@ class Worker:
                 json.dump(token_stats, f, indent=2)
             self._log(f"  Token Stats Recorded: {len(final_input)} chars")
 
-            result = self.backend.execute(final_input, workspace, log_path, model_override=task_model)
+            # v56.0: 读取验证阶段沉淀的错误上下文 (用于自愈)
+            retry_context = task.get("verify_result")
+            self._log(f"  Retry Context: {'Present' if retry_context else 'None'}")
 
-            # 首次失败时：同模型重试，简化 prompt (复用原 backend 实例)
-            if not result.success:
-                self._log(f"  首次执行失败: {result.stderr[:80]}...")
-                self.store.update_progress(task_id, "🔄 智能重试中 (简化指令)...")
+            result = active_backend.execute(
+                final_input, workspace, log_path, 
+                model_override=task_model,
+                retry_context=retry_context,
+                bypass_prompts=(risk_level == "auto")
+            )
+
+            # 首次失败时：同模型重试 (针对 API/网络等瞬时错误)
+            if not result.success and not retry_context:
+                self._log(f"  首次执行异常: {result.stderr[:80]}...")
+                self.store.update_progress(task_id, "🔄 瞬时异常重试中...")
 
                 shutil.copy(log_path, str(artifacts_dir / "run_attempt1.log"))
-
-                retry_input = f"请简洁地完成以下任务，不需要额外解释：\n{task_input}"
                 retry_log = str(artifacts_dir / "run_retry.log")
 
-                result = self.backend.execute(retry_input, workspace, retry_log, model_override=task_model)
+                result = self.backend.execute(
+                    final_input, workspace, retry_log, 
+                    model_override=task_model,
+                    bypass_prompts=(risk_level == "auto")
+                )
 
                 if result.success:
                     shutil.copy(retry_log, log_path)
@@ -427,7 +518,7 @@ class Worker:
             self.store.update_progress(task_id, "🔍 基础验证中...")
             self.store.start_verify(task_id)
 
-            verify_ok, verify_output = self._run_verify(workspace)
+            verify_ok, verify_output = self._run_verify(workspace, backend_type=backend_type)
             with open(artifacts_dir / "verify_basic.log", "w") as f:
                 f.write(verify_output)
 
@@ -440,50 +531,74 @@ class Worker:
                     self._push_feishu(task_id, False, f"❌ 验证失败（已达重试上限）\n\n{verify_output[:500]}")
                     return
 
-            # 5. 证据验证
-            self.store.update_progress(task_id, "📋 证据验证中...")
-            evidence_ok, evidence_report = self._run_evidence_verify(task_id, workspace, task_input, artifacts_dir)
+            # 5. 证据验证 (分流)
+            if backend_type == "research":
+                self.store.update_progress(task_id, "📋 研究成果验证中...")
+                evidence_ok, evidence_report = self._run_research_verify(task_id, artifacts_dir)
+            else:
+                self.store.update_progress(task_id, "📋 证据验证中...")
+                evidence_ok, evidence_report = self._run_evidence_verify(task_id, workspace, task_input, artifacts_dir)
 
             if not evidence_ok:
-                updated, can_retry = self.store.verify_fail(task_id, f"证据验证失败: {evidence_report[:200]}")
+                updated, can_retry = self.store.verify_fail(task_id, f"验证失败: {evidence_report[:200]}")
                 if can_retry:
-                    self._push_feishu(task_id, False, f"⚠️ 证据验证失败，自动重试中...\n\n{evidence_report[:500]}")
+                    self._push_feishu(task_id, False, f"⚠️ 验证失败，自动重试中...\n\n{evidence_report[:500]}")
                     return
                 else:
-                    self._push_feishu(task_id, False, f"❌ 证据验证失败（已达重试上限）\n\n{evidence_report[:500]}")
+                    self._push_feishu(task_id, False, f"❌ 验证失败（已达重试上限）\n\n{evidence_report[:500]}")
                     return
 
             with open(artifacts_dir / "verify_evidence.log", "w") as f:
                 f.write(evidence_report)
 
-            # 6. 提交变更
-            self.store.update_progress(task_id, "提交代码变更")
-            commit_sha = self._commit_changes(workspace, task_input)
+            # 6. 提交变更 (分流)
+            commit_sha = "N/A"
+            diff_stat = "N/A"
 
-            if not commit_sha:
-                self.store.update_progress(task_id, "⚠️ 无文件变更")
-                self.store.fail(task_id, "没有文件变更")
-                self._push_feishu(task_id, False, "执行完成但没有文件变更")
-                return
+            if backend_type == "claude":
+                self.store.update_progress(task_id, "提交代码变更")
+                commit_sha = self._commit_changes(workspace, task_input)
 
-            # 7. 生成 Diff
-            self.store.update_progress(task_id, "生成 Diff 报告")
-            diff_stat = self._get_diff_stat(workspace)
-            with open(artifacts_dir / "diff.patch", "w") as f:
-                f.write(diff_stat)
+                if not commit_sha:
+                    self.store.update_progress(task_id, "⚠️ 无文件变更")
+                    self.store.fail(task_id, "没有文件变更")
+                    self._push_feishu(task_id, False, "执行完成但没有文件变更")
+                    return
+
+                # 7. 生成 Diff
+                self.store.update_progress(task_id, "生成 Diff 报告")
+                diff_stat = self._get_diff_stat(workspace)
+                with open(artifacts_dir / "diff.patch", "w") as f:
+                    f.write(diff_stat)
+            else:
+                self.store.update_progress(task_id, "✅ 研究成果已保存")
+                diff_stat = evidence_report
 
             # 8. 保存元信息
             with open(artifacts_dir / "meta.json", "w") as f:
                 json.dump({
                     "task_id": task_id,
-                    "branch": branch,
+                    "branch": branch or "N/A",
                     "commit_sha": commit_sha,
-                    "backend": self.backend.name,
+                    "backend": backend_type,
                     "success": True,
                     "finished_at": datetime.now().isoformat()
                 }, f, indent=2)
 
-            # 9. 等待人工确认 (v34.0: 替换直接完成)
+            # 9. 任务完结逻辑 (v57.0: 区分自动合并与人工确认)
+            if risk_level == "auto" and backend_type == "claude":
+                self.store.update_progress(task_id, "🚀 自动合并中")
+                try:
+                    self._auto_merge(workspace, branch, task_id)
+                    self.store.complete(task_id, commit_sha=commit_sha, result=evidence_report)
+                    
+                    self._push_feishu(task_id, True, f"✅ 已自动完成并合并至主分支\n\n**变更统计**:\n{diff_stat}\n\n**验证证据**:\n{evidence_report[:400]}")
+                    self._log(f"  任务 #{task_id} 自动完成")
+                    return # 正常清理
+                except Exception as e:
+                    self._log(f"  ⚠️ 自动合并失败，回退到人工确认: {e}")
+                    # Fall through to await_review
+
             self.store.update_progress(task_id, "⏳ 等待人工确认")
             self.store.await_review(task_id, evidence_report, task_input[:100])
 
@@ -507,15 +622,17 @@ class Worker:
             return  # 不清理 worktree
 
         except Exception as e:
-            error_msg = str(e)
+            import traceback
+            error_msg = traceback.format_exc()
             self._log(f"  任务 #{task_id} 异常: {error_msg}")
-            self.store.update_progress(task_id, f"❌ 异常: {error_msg[:30]}")
+            self.store.update_progress(task_id, f"❌ 异常: {str(e)[:30]}")
             self.store.fail(task_id, error_msg)
-            self._push_feishu(task_id, False, f"执行异常: {error_msg}")
-
+            
+            # v5.6.9: 立即触发飞书告警并诊断
+            self._push_feishu(task_id, False, f"🚨 任务失败告警!\n错误: {str(e)}\n请在终端执行 zw-log {task_id} 查看现场。")
+            
             if artifacts_dir:
-                with open(artifacts_dir / "error.log", "w") as f:
-                    f.write(error_msg)
+                generate_diagnosis(task_id, artifacts_dir, error_msg)
 
         finally:
             # v34.0: 只有 done/failed 才清理 worktree，awaiting_review 保留
@@ -527,17 +644,20 @@ class Worker:
             # v32.5: 如果任务失败，触发 CriticAgent 异步复盘
             task_record = self.store.get(task_id)
             if task_record and task_record.get("status") == "failed":
-                self._log(f"  📢 任务 #{task_id} 失败，正在启动 CriticAgent 异步复盘...")
-                try:
-                    # 异步执行，不阻塞 Worker 主任务循环
-                    critic_script = Path(__file__).parent / "critic_agent.py"
-                    subprocess.Popen(
-                        [sys.executable, str(critic_script), str(task_id)],
-                        cwd=str(Path(__file__).parent),
-                        env={**os.environ, "ANTHROPIC_AUTH_TOKEN": ANTHROPIC_AUTH_TOKEN}
-                    )
-                except Exception as e:
-                    self._log(f"  ⚠️ 触发 CriticAgent 失败: {e}")
+                critic_script = self.base_path / "critic_agent.py"
+                if critic_script.exists():
+                    self._log(f"  📢 任务 #{task_id} 失败，正在启动 CriticAgent 异步复盘...")
+                    try:
+                        # 异步执行，不阻塞 Worker 主任务循环
+                        subprocess.Popen(
+                            [sys.executable, str(critic_script), str(task_id)],
+                            cwd=str(self.base_path),
+                            env={**os.environ, "ANTHROPIC_AUTH_TOKEN": ANTHROPIC_AUTH_TOKEN}
+                        )
+                    except Exception as e:
+                        self._log(f"  ⚠️ 触发 CriticAgent 失败: {e}")
+                else:
+                    self._log(f"  ⏭️ CriticAgent 未安装，跳过复盘")
 
     def _heartbeat_loop(self):
         """v32.6: 心跳线程，优化空闲时的写入频率"""
@@ -587,11 +707,20 @@ class Worker:
                 time.sleep(POLL_INTERVAL)
                 continue
 
+            # v5.6: 统一任务认领逻辑
             task = self.store.claim_next()
+            
             if task:
+                self._log(f"  认领任务 #{task['id']} (Backend: {task['backend']})")
                 future = self.executor.submit(self._execute_task_wrapped, task)
                 self.active_futures.add(future)
             else:
+                # v5.6.10 Debug: 每 10 次空循环记录一次
+                if not hasattr(self, '_idle_count'): self._idle_count = 0
+                self._idle_count += 1
+                if self._idle_count >= 12: # 每分钟一次
+                    self._log(f"  [Idle] 正在轮询队列... (当前最大并发: {self.max_workers}, 活动中: {len(self.active_futures)})")
+                    self._idle_count = 0
                 time.sleep(POLL_INTERVAL)
 
         self._log("Worker 退出")

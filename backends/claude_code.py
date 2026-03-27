@@ -1,4 +1,4 @@
-"""Claude Code 执行后端"""
+"""OpenClaw 执行后端 (Dockerized)"""
 
 import subprocess
 import os
@@ -8,100 +8,164 @@ from .base import DevBackend, ExecuteResult
 
 
 class ClaudeCodeBackend(DevBackend):
+    """
+    OpenClaw 执行后端 (Dockerized)
+    遵循 AGENTS.md: Host 为 Limb, Docker (clawdbot) 为 Brain.
+    """
 
-    def __init__(self, model: str = "qwen3-coder-plus",
-                 allowed_tools: str = "Edit,Write,Read",
-                 timeout: int = 300):
-        self.model = model
-        self.allowed_tools = allowed_tools
+    def __init__(self, agent_id: str = "main",
+                 timeout: int = 1200):
+        self.agent_id = agent_id
         self.timeout = timeout
+        
+        # 引入消息总线用于执行中的心跳反馈
+        try:
+            from message_bus import MessageBus
+            self.msg_bus = MessageBus()
+        except:
+            self.msg_bus = None
 
     @property
     def name(self) -> str:
-        return "claude_code"
+        return "openclaw_docker"
 
-    def execute(self, task: str, workspace: str, log_path: str, model_override: str = None) -> ExecuteResult:
-        """执行开发任务"""
-        target_model = model_override or self.model
+    def execute(self, task: str, workspace: str, log_path: str, 
+                model_override: str = None, retry_context: str = None,
+                bypass_prompts: bool = False) -> ExecuteResult:
+        """在 Docker 容器内执行开发/研究任务"""
+        
+        # 1. 路径转换 (Host -> Container)
+        # Host: /Users/liufang/clawdbot-docker/workspace/tasks/task-42
+        # Container: /root/workspace/tasks/task-42
+        container_workspace = workspace.replace("/Users/liufang/clawdbot-docker/workspace", "/root/workspace")
+        
+        # 2. 注入自愈上下文
+        final_task = task
+        if retry_context:
+            final_task = f"【自愈修复指令】\n上一次执行验证失败。错误输出如下：\n---\n{retry_context}\n---\n请分析失败原因并修正。原始需求是：\n{task}"
+
+        # 3. 构造 Docker 命令
+        # 使用容器内安装的 claude (Claude Code) CLI
+        # 注入宿主机的 API Key 确保认证通过
+        dashscope_key = os.environ.get("DASHSCOPE_API_KEY", "")
+        qwen_key = os.environ.get("QWEN_API_KEY", "")
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        
+        # v5.6.1: 核心变更 - 在大脑容器内执行 Chief Engineer 任务
+        # 使用 npx -y 确保即便没有全局安装也能直接运行
+        # 3. 构造 Docker 命令
+        task_safe = final_task.replace('"', '\\"')
+        
+        # 使用 bash -c 封装以获得更好的参数处理稳定性
+        inner_cmd = f"npx -y @anthropic-ai/claude-code --dangerously-skip-permissions --allowedTools Edit,Write,Read,Terminal,Search \"{task_safe}\""
+        
         cmd = [
-            "claude", "-p", task,
-            "--model", target_model,
-            "--allowedTools", self.allowed_tools,
+            "docker", "exec",
+            "--user", "1000:1000",
+            "-e", "HOME=/home/node",
+            "-e", f"DASHSCOPE_API_KEY={dashscope_key}",
+            "-e", f"QWEN_API_KEY={qwen_key}",
+            "-e", f"ANTHROPIC_API_KEY={anthropic_key}",
+            "-e", "TERM=xterm",
+            "-e", "COLUMNS=80",
+            "-w", container_workspace,
+            "clawdbot",
+            "bash", "-c", inner_cmd
         ]
 
-        # 确保工作目录存在
-        workspace = os.path.expanduser(workspace)
-        if not os.path.exists(workspace):
-            return ExecuteResult(
-                success=False,
-                stdout="",
-                stderr=f"Workspace not found: {workspace}",
-                returncode=1
-            )
-
+        # 4. 执行命令 (流式执行)
+        log_path = os.path.expanduser(log_path)
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        
         try:
-            # 执行命令
-            result = subprocess.run(
-                cmd,
-                cwd=workspace,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                env={**os.environ, "CLAUDECODE": ""}  # 清除嵌套标记
-            )
+            with open(log_path, "w") as log_file:
+                log_file.write(f"=== ZHIWEI AUDIT START ===\n")
+                log_file.write(f"TIME: {Path('/etc/timezone').read_text().strip() if Path('/etc/timezone').exists() else 'N/A'}\n")
+                log_file.write(f"CMD: {' '.join(cmd)}\n")
+                log_file.write(f"==========================\n\n")
+                log_file.flush()
 
-            # 写入日志
-            log_path = os.path.expanduser(log_path)
-            with open(log_path, "w") as f:
-                f.write(f"=== COMMAND ===\n{' '.join(cmd)}\n\n")
-                f.write(f"=== CWD ===\n{workspace}\n\n")
-                f.write(f"=== STDOUT ===\n{result.stdout}\n\n")
-                f.write(f"=== STDERR ===\n{result.stderr}\n\n")
-                f.write(f"=== RETURNCODE ===\n{result.returncode}\n")
+                # 使用 Popen 开启流式输出
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1, # Line buffered
+                    preexec_fn=os.setsid if os.name != 'nt' else None # Create process group
+                )
+
+                import time
+                start_time = time.time()
+                last_heartbeat = start_time
+                returncode = None
+
+                while returncode is None:
+                    # 检查是否超时
+                    elapsed = time.time() - start_time
+                    if elapsed > self.timeout:
+                        import signal
+                        if os.name != 'nt':
+                            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                        else:
+                            process.kill()
+                            
+                        log_file.write(f"\n[ERROR] Task timeout after {self.timeout}s\n")
+                        return ExecuteResult(
+                            success=False, stdout="", 
+                            stderr=f"Timeout after {self.timeout}s", 
+                            returncode=-1
+                        )
+
+                    # 每 60s 发送一条进度心跳到 MessageBus (v57.0)
+                    if time.time() - last_heartbeat > 60:
+                        mins = int(elapsed // 60)
+                        msg = f"🤖 知微大脑正在深度思考与编码中... (已耗时 {mins}min)"
+                        if self.msg_bus:
+                            self.msg_bus.publish(
+                                sender="zhiwei-dev/backend",
+                                topic="feishu_notification",
+                                content=msg,
+                                metadata={"type": "progress_heartbeat", "elapsed": elapsed}
+                            )
+                        last_heartbeat = time.time()
+
+                    # 非阻塞等待
+                    try:
+                        returncode = process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        continue
+
+            # 读取产生的日志用于返回结果（即便已经是流式写入，ExecuteResult 仍需返回内容摘要）
+            with open(log_path, "r") as f:
+                full_log = f.read()
 
             return ExecuteResult(
-                success=result.returncode == 0,
-                stdout=result.stdout,
-                stderr=result.stderr,
-                returncode=result.returncode
+                success=returncode == 0,
+                stdout=full_log,
+                stderr="",
+                returncode=returncode
             )
 
-        except subprocess.TimeoutExpired:
-            return ExecuteResult(
-                success=False,
-                stdout="",
-                stderr=f"Timeout after {self.timeout}s",
-                returncode=-1
-            )
         except Exception as e:
-            return ExecuteResult(
-                success=False,
-                stdout="",
-                stderr=str(e),
-                returncode=-1
-            )
+            # 记录异常到日志
+            with open(log_path, "a") as f:
+                f.write(f"\n[CRITICAL ERROR] {str(e)}\n")
+            return ExecuteResult(success=False, stdout="", stderr=str(e), returncode=-1)
 
 
 # 测试代码
 if __name__ == "__main__":
+    # 模拟 Host 路径
     backend = ClaudeCodeBackend()
-
-    # 创建测试目录
-    test_dir = "/tmp/claude-backend-test"
+    test_dir = "/Users/liufang/clawdbot-docker/workspace/tasks/test-run"
     os.makedirs(test_dir, exist_ok=True)
-
+    
+    print(f"Testing container backend in: {test_dir}")
     result = backend.execute(
-        task="创建 test.py，内容为 print('backend test ok')",
+        task="Say hello and create a file named 'hello.txt' with content 'brain ok'",
         workspace=test_dir,
         log_path=f"{test_dir}/run.log"
     )
-
     print(f"Success: {result.success}")
     print(f"Stdout: {result.stdout[:200]}")
-
-    # 验证文件
-    test_file = f"{test_dir}/test.py"
-    if os.path.exists(test_file):
-        print(f"File content: {open(test_file).read()}")
-    else:
-        print("File not created!")

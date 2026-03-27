@@ -120,8 +120,8 @@ class TaskStore:
                     return existing["id"]
 
             cursor = conn.execute(
-                "INSERT INTO tasks (input, message_id, status, repo_path, model, backend) VALUES (?, ?, ?, ?, ?, ?)",
-                (task_input, message_id, initial_status, kwargs.get('repo_path'), kwargs.get('model'), backend)
+                "INSERT INTO tasks (input, message_id, status, repo_path, model, backend, max_attempts) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (task_input, message_id, initial_status, kwargs.get('repo_path'), kwargs.get('model'), backend, 5 if backend == 'claude' else 2)
             )
             task_id = cursor.lastrowid
             
@@ -293,7 +293,7 @@ class TaskStore:
 
     # ========== v34.0: 基于证据的完成机制 ==========
 
-    MAX_VERIFY_ATTEMPTS = 1  # 最大验证重试次数
+    MAX_VERIFY_ATTEMPTS = 3  # 最大验证重试次数 (v56.0: 增加为 3 次以支持自愈)
 
     def start_verify(self, task_id: int) -> bool:
         """标记任务进入验证阶段"""
@@ -356,13 +356,15 @@ class TaskStore:
             return cursor.rowcount > 0
 
     def reject_with_retry(self, task_id: int, reason: str) -> bool:
-        """人工拒绝，重新执行"""
+        """人工拒绝，重新执行 (v56.0: 重置尝试计数以支持自愈)"""
         with self._connect() as conn:
             cursor = conn.execute("""
                 UPDATE tasks SET status = 'pending',
+                    attempts = 1,
+                    verify_attempts = 0,
                     verify_result = ?, progress = '人工拒绝，等待重新执行'
                 WHERE id = ? AND status = 'awaiting_review'
-            """, (f"人工拒绝: {reason}", task_id))
+            """, (f"人工提示: {reason}", task_id))
             return cursor.rowcount > 0
 
 
