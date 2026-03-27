@@ -50,7 +50,12 @@ class ClaudeCodeBackend(DevBackend):
         dashscope_key = os.environ.get("DASHSCOPE_API_KEY", "")
         qwen_key = os.environ.get("QWEN_API_KEY", "")
         anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        
+
+        # v5.8: 支持百炼 API (Anthropic 兼容端点)
+        anthropic_base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+        anthropic_auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+        anthropic_model = os.environ.get("ANTHROPIC_MODEL", "glm-5")
+
         # v5.6.1: 核心变更 - 在大脑容器内执行 Chief Engineer 任务
         # 使用 npx -y 确保即便没有全局安装也能直接运行
         # v5.7: 修复 --print 模式，通过 stdin 传入任务
@@ -66,6 +71,9 @@ class ClaudeCodeBackend(DevBackend):
             "-e", f"DASHSCOPE_API_KEY={dashscope_key}",
             "-e", f"QWEN_API_KEY={qwen_key}",
             "-e", f"ANTHROPIC_API_KEY={anthropic_key}",
+            "-e", f"ANTHROPIC_BASE_URL={anthropic_base_url}",
+            "-e", f"ANTHROPIC_AUTH_TOKEN={anthropic_auth_token}",
+            "-e", f"ANTHROPIC_MODEL={anthropic_model}",
             "-e", "TERM=xterm",
             "-e", "COLUMNS=80",
             "-w", container_workspace,

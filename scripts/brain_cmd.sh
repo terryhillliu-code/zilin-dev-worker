@@ -21,10 +21,15 @@ fi
 echo "🧠 正在连接知微大脑 (Docker: $CONTAINER)..."
 
 # 执行容器内 Claude Code (使用 stdin 传入任务)
+# v5.8: 支持百炼 API (Anthropic 兼容端点)
+# v5.9: 添加模型配置
 docker exec \
     --user 1000:1000 \
     -e HOME=/home/node \
     -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+    -e ANTHROPIC_BASE_URL="$ANTHROPIC_BASE_URL" \
+    -e ANTHROPIC_AUTH_TOKEN="$ANTHROPIC_AUTH_TOKEN" \
+    -e ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-glm-5}" \
     -e TERM=xterm \
     -e COLUMNS=100 \
     -w "$WORKSPACE" \
