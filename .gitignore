@@ -28,3 +28,6 @@ artifacts/
 # 数据库备份
 db_backups/
 
+
+# Runtime databases
+*.db
