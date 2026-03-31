@@ -381,21 +381,37 @@ class Worker:
         )
         return result.stdout
 
-    def _auto_merge(self, workspace: str, branch: str, task_id: int):
-        """自动合并变更到主分支 (v57.0)"""
+    def _auto_merge(self, workspace: str, branch: str, task_id: int, repo_path: str = None):
+        """自动合并变更到主分支 (v58.4: 修复 worktree 冲突)"""
         self._log(f"  🚀 开启自动合并模式 (Task #{task_id})")
-        
-        # 1. 切换回 main
-        subprocess.run(["git", "checkout", "main"], cwd=workspace, capture_output=True)
-        
-        # 2. 合并分支
-        merge_res = subprocess.run(["git", "merge", branch, "--no-edit"], 
-                                   cwd=workspace, capture_output=True, text=True)
-        
+
+        # v58.4: 确定主仓库路径
+        main_repo = os.path.expanduser(repo_path) if repo_path else BASE_REPO
+
+        # 1. 先推送当前分支到远程
+        push_res = subprocess.run(
+            ["git", "push", "origin", branch, "--force"],
+            cwd=workspace, capture_output=True, text=True
+        )
+        if push_res.returncode != 0:
+            self._log(f"  ⚠️ 推送分支失败: {push_res.stderr}")
+            raise RuntimeError(f"推送分支失败: {push_res.stderr}")
+
+        # 2. 在主仓库执行合并
+        subprocess.run(["git", "fetch", "origin"], cwd=main_repo, capture_output=True)
+
+        merge_res = subprocess.run(
+            ["git", "merge", f"origin/{branch}", "--no-edit"],
+            cwd=main_repo, capture_output=True, text=True
+        )
+
         if merge_res.returncode != 0:
             self._log(f"  ❌ 自动合并冲突: {merge_res.stderr}")
             raise RuntimeError(f"自动合并冲突，请手动处理: {merge_res.stderr}")
-            
+
+        # 3. 推送主仓库到远程
+        subprocess.run(["git", "push", "origin", "main"], cwd=main_repo, capture_output=True)
+
         self._log(f"  ✅ 自动合并成功")
 
     def _push_feishu(self, task_id: int, success: bool, message: str):
@@ -763,7 +779,8 @@ class Worker:
             if risk_level == "auto" and backend_type == "claude":
                 self._update_stage_with_alert(task_id, "🚀 自动合并中")
                 try:
-                    self._auto_merge(workspace, branch, task_id)
+                    repo_path = task.get("repo_path")
+                    self._auto_merge(workspace, branch, task_id, repo_path=repo_path)
                     self.store.complete(task_id, commit_sha=commit_sha, result=evidence_report)
 
                     self._push_feishu(task_id, True, f"✅ 已自动完成并合并至主分支\n\n**变更统计**:\n{diff_stat}\n\n**验证证据**:\n{evidence_report[:400]}")
