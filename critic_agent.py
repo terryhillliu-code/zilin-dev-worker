@@ -11,6 +11,12 @@ import logging
 from pathlib import Path
 from datetime import datetime
 import re
+
+# v58.6: 先加载全局密钥
+sys.path.insert(0, str(Path(__file__).parent))
+from zhiwei_common.secrets import load_secrets
+load_secrets(silent=True)
+
 from task_store import TaskStore
 
 # 尝试导入 openai（百炼兼容）
