@@ -781,7 +781,7 @@ class Worker:
                 try:
                     repo_path = task.get("repo_path")
                     self._auto_merge(workspace, branch, task_id, repo_path=repo_path)
-                    self.store.complete(task_id, commit_sha=commit_sha, result=evidence_report)
+                    self.store.complete(task_id, branch=branch, commit_sha=commit_sha, result=evidence_report)
 
                     self._push_feishu(task_id, True, f"✅ 已自动完成并合并至主分支\n\n**变更统计**:\n{diff_stat}\n\n**验证证据**:\n{evidence_report[:400]}")
                     self._log(f"  任务 #{task_id} 自动完成")
