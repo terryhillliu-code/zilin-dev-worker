@@ -81,6 +81,7 @@ HEARTBEAT_INTERVAL = 30  # 秒
 
 # v58.0: 阶段超时阈值 (秒) - 超过则推送卡住告警
 STUCK_THRESHOLDS = {
+    "🔍 API 预检中...": 20,
     "准备 Artifacts": 30,
     "准备工作区": 60,
     "准备研究沙盒": 30,
@@ -478,6 +479,55 @@ class Worker:
         self._task_stage_times[task_id] = (stage, time.time())
         self._push_feishu_progress(task_id, stage)
 
+    def _check_api_available(self) -> tuple[bool, str]:
+        """v58.1: 检查 API 是否可用 (容器内预检)
+        返回 (is_available, error_message)
+        """
+        # 获取环境变量
+        anthropic_auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+        anthropic_base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+
+        # 检查必要的环境变量
+        if not anthropic_auth_token:
+            return False, "ANTHROPIC_AUTH_TOKEN 未设置"
+
+        # 在容器内执行一个简单的测试命令
+        test_cmd = [
+            "docker", "exec",
+            "--user", "1000:1000",
+            "-e", "HOME=/home/node",
+            "-e", f"ANTHROPIC_AUTH_TOKEN={anthropic_auth_token}",
+            "-e", f"ANTHROPIC_BASE_URL={anthropic_base_url}",
+            "-e", "ANTHROPIC_MODEL=glm-5",
+            "clawdbot",
+            "bash", "-c",
+            "echo 'test' | timeout 10 npx -y @anthropic-ai/claude-code --print 2>&1 | head -5"
+        ]
+
+        try:
+            result = subprocess.run(
+                test_cmd,
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+
+            # 检查是否有认证错误
+            output = result.stdout + result.stderr
+            if "403" in output or "forbidden" in output.lower():
+                return False, "API 认证失败 (403 Forbidden)"
+            if "401" in output or "unauthorized" in output.lower():
+                return False, "API 认证失败 (401 Unauthorized)"
+            if "api_key" in output.lower() and "error" in output.lower():
+                return False, "API Key 无效"
+
+            return True, "OK"
+
+        except subprocess.TimeoutExpired:
+            return False, "API 预检超时 (15s)"
+        except Exception as e:
+            return False, f"预检异常: {str(e)}"
+
     def _check_and_alert_stuck(self, task_id: int):
         """v58.0: 检查是否卡住，推送告警"""
         if task_id not in self._task_stage_times:
@@ -518,6 +568,17 @@ class Worker:
         # v32.4: 风险评估
         risk_level = self._assess_risk(task_input)
         self._log(f"  风险等级: {risk_level}")
+
+        # v58.1: API 预检 (仅 claude 后端)
+        if backend_type == "claude":
+            self._update_stage_with_alert(task_id, "🔍 API 预检中...")
+            api_ok, api_error = self._check_api_available()
+            if not api_ok:
+                self._log(f"  ❌ API 预检失败: {api_error}")
+                self.store.fail(task_id, f"API 预检失败: {api_error}")
+                self._push_feishu(task_id, False, f"🚨 API 预检失败\n\n**错误**: {api_error}\n\n请检查 API Key 配置或联系管理员。")
+                return
+            self._log(f"  ✅ API 预检通过")
 
         workspace = None
         branch = None
