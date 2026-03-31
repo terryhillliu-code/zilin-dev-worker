@@ -57,12 +57,15 @@ class ClaudeCodeBackend(DevBackend):
         anthropic_model = os.environ.get("ANTHROPIC_MODEL", "glm-5")
 
         # v5.6.1: 核心变更 - 在大脑容器内执行 Chief Engineer 任务
-        # 使用 npx -y 确保即便没有全局安装也能直接运行
-        # v5.7: 修复 --print 模式，通过 stdin 传入任务
-        # 使用 bash -c 封装以获得更好的参数处理稳定性
+        # v58.2: 使用容器内安装的 claude 命令而非 npx (更可靠)
+        # 使用 heredoc 处理多行任务，避免引号转义问题
         task_safe = final_task.replace("'", "'\"'\"'")  # 单引号转义
 
-        inner_cmd = f"echo '{task_safe}' | npx -y @anthropic-ai/claude-code --dangerously-skip-permissions --allowedTools Edit,Write,Read,Terminal,Search --print"
+        # 使用 heredoc 传入任务 (支持多行)
+        inner_cmd = f"""claude -p "$(cat <<'TASK_EOF'
+{task_safe}
+TASK_EOF
+)" --allowedTools Edit,Write,Read,Terminal,Search"""
         
         cmd = [
             "docker", "exec",
