@@ -382,27 +382,44 @@ class Worker:
         return result.stdout
 
     def _auto_merge(self, workspace: str, branch: str, task_id: int, repo_path: str = None):
-        """自动合并变更到主分支 (v58.4: 修复 worktree 冲突)"""
+        """自动合并变更到主分支 (v58.7: 增加超时和本地合并降级)"""
         self._log(f"  🚀 开启自动合并模式 (Task #{task_id})")
 
         # v58.4: 确定主仓库路径
         main_repo = os.path.expanduser(repo_path) if repo_path else BASE_REPO
 
-        # 1. 先推送当前分支到远程
+        # v58.7: 尝试推送，设置超时 30 秒
         push_res = subprocess.run(
             ["git", "push", "origin", branch, "--force"],
-            cwd=workspace, capture_output=True, text=True
+            cwd=workspace, capture_output=True, text=True, timeout=30
         )
+
         if push_res.returncode != 0:
-            self._log(f"  ⚠️ 推送分支失败: {push_res.stderr}")
-            raise RuntimeError(f"推送分支失败: {push_res.stderr}")
+            # v58.7: 推送失败时，尝试本地合并（不推送到远程）
+            self._log(f"  ⚠️ 推送分支失败（网络问题？），尝试本地合并...")
+
+            # 本地合并
+            merge_res = subprocess.run(
+                ["git", "merge", branch, "--no-edit"],
+                cwd=workspace, capture_output=True, text=True, timeout=30
+            )
+
+            if merge_res.returncode != 0:
+                self._log(f"  ❌ 本地合并冲突: {merge_res.stderr}")
+                raise RuntimeError(f"合并冲突，请手动处理: {merge_res.stderr}")
+
+            self._log(f"  ✅ 本地合并成功（未推送到远程）")
+            return
 
         # 2. 在主仓库执行合并
-        subprocess.run(["git", "fetch", "origin"], cwd=main_repo, capture_output=True)
+        try:
+            subprocess.run(["git", "fetch", "origin"], cwd=main_repo, capture_output=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            self._log(f"  ⚠️ fetch 超时，跳过远程同步")
 
         merge_res = subprocess.run(
             ["git", "merge", f"origin/{branch}", "--no-edit"],
-            cwd=main_repo, capture_output=True, text=True
+            cwd=main_repo, capture_output=True, text=True, timeout=30
         )
 
         if merge_res.returncode != 0:
@@ -410,7 +427,10 @@ class Worker:
             raise RuntimeError(f"自动合并冲突，请手动处理: {merge_res.stderr}")
 
         # 3. 推送主仓库到远程
-        subprocess.run(["git", "push", "origin", "main"], cwd=main_repo, capture_output=True)
+        try:
+            subprocess.run(["git", "push", "origin", "main"], cwd=main_repo, capture_output=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            self._log(f"  ⚠️ 推送主分支超时，但本地合并已完成")
 
         self._log(f"  ✅ 自动合并成功")
 
