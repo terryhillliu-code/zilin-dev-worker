@@ -93,6 +93,15 @@ STUCK_THRESHOLDS = {
     "提交代码变更": 30,
 }
 
+# v58.3: 只推送关键阶段（减少飞书噪音）
+KEY_STAGES = {
+    "🚀 任务开始执行",      # 任务开始
+    "🤖 AI 执行中...",      # AI 开始工作
+    "✅ 任务完成",          # 成功
+    "❌ 任务失败",          # 失败
+    "⏳ 等待人工确认",      # 需要确认
+}
+
 class Worker:
     def __init__(self, check_interval: int = 5, max_workers: int = 5):
         self.store = TaskStore()
@@ -474,10 +483,12 @@ class Worker:
             self._log(f"  ⚠️ 进度推送失败: {e}")
 
     def _update_stage_with_alert(self, task_id: int, stage: str):
-        """v58.0: 更新阶段 + 推送飞书 + 记录时间 (用于卡住检测)"""
+        """v58.3: 更新阶段 + 推送飞书（仅关键阶段） + 记录时间"""
         self.store.update_progress(task_id, stage)
         self._task_stage_times[task_id] = (stage, time.time())
-        self._push_feishu_progress(task_id, stage)
+        # 只推送关键阶段
+        if stage in KEY_STAGES or "⚠️" in stage or "❌" in stage:
+            self._push_feishu_progress(task_id, stage)
 
     def _check_api_available(self) -> tuple[bool, str]:
         """v58.1: 检查 API 是否可用 (容器内预检)
