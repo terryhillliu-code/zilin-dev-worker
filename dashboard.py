@@ -24,7 +24,7 @@ def main():
     worker_ps = get_output("ps aux | grep -i 'worker.py' | grep -v grep")
     status = "🟢 运行中" if worker_ps != "N/A" else "🔴 已停止 (待命)"
     
-    print(f"⚙️  \033[1;33m摄取产出\033[0m: 任务 #\033[1;32m{task_id}\033[0m | {} | 物理产出: \033[1;32m{json_count}\033[0m/1882".format(status))
+    print(f"⚙️  \033[1;33m摄取产出\033[0m: 任务 #\033[1;32m{task_id}\033[0m | {status} | 物理产出: \033[1;32m{json_count}\033[0m/1882")
     
     # 3. 智立方链路 (Brain)
     rag_ps = get_output("ps aux | grep -i 'main.py server' | grep -v grep")
@@ -44,4 +44,5 @@ def main():
     print(f"\n\033[1;30m指令提示: zw-log (看详情) | zw-how (看进度) | zw-shell (看内部)\033[0m")
 
 if __name__ == '__main__':
-    main()# Optimized Pipeline v57 Verification
+    main()
+# Optimized Pipeline v57 Verification
