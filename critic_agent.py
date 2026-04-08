@@ -33,9 +33,9 @@ ARTIFACTS_BASE = Path(__file__).parent / "artifacts"
 
 # 百炼 API 配置 (Phase 4.4.1: 使用顶级推理模型)
 MODEL_CRITIC = "qwen3-max-2026-01-23"
-# v58.2: 优先使用 BAILIAN_API_KEY (支持推理模型)
-BAILIAN_API_KEY = os.environ.get("BAILIAN_API_KEY", "") or os.environ.get("DASHSCOPE_API_KEY", "")
-ANTHROPIC_BASE_URL = "https://coding.dashscope.aliyuncs.com/v1"
+# v58.7: 使用百炼 Coding Plan 端点 (需要 sk-sp-* 格式的 Key)
+BAILIAN_API_KEY = os.environ.get("BAILIAN_API_KEY", "") or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+ANTHROPIC_BASE_URL = "https://coding.dashscope.aliyuncs.com/apps/anthropic"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
