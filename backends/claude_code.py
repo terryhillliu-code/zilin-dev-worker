@@ -22,7 +22,7 @@ class ClaudeCodeBackend(DevBackend):
         try:
             from message_bus import MessageBus
             self.msg_bus = MessageBus()
-        except:
+        except Exception:
             self.msg_bus = None
 
     @property
